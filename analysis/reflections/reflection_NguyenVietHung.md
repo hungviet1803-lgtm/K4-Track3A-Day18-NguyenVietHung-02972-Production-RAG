@@ -45,21 +45,26 @@
 
 ## Phần 3: Action Plan cho Project cá nhân (Application Plan)
 
-> ⚠️ **[Cần tự điền]** — phần này phụ thuộc vào project của bạn. Các gợi ý dưới đây rút ra từ kết quả lab; sửa lại cho khớp với dữ liệu và mục tiêu thực tế.
+### Project: Trợ lý hỏi đáp quy chế nội bộ (HR/IT Policy Assistant)
 
-### Project: [Tên project của bạn]
+Chatbot giúp nhân viên tra cứu chính sách nhân sự, tài chính, IT (nghỉ phép, lương, tạm ứng, mật khẩu, mua sắm...) bằng tiếng Việt, trả lời kèm trích dẫn tài liệu và phiên bản đang hiệu lực. Phát triển tiếp từ pipeline của lab này.
 
 #### 1. Hiện trạng
-- **Pipeline hiện tại:** [Mô tả ngắn kiến trúc RAG đang áp dụng]
-- **Vấn đề / Bottlenecks đang gặp:** [Retrieval precision thấp, hallucination, latency cao, ...]
+- **Pipeline hiện tại:** Naive RAG — chunk theo đoạn (≤500 ký tự) → dense search bge-m3 top-3 → LLM trả lời. RAGAS đo được: faithfulness 0.84, answer relevancy 0.71, context precision 0.87, context recall 0.85.
+- **Vấn đề / Bottlenecks đang gặp:**
+  - **Xung đột phiên bản:** tài liệu có nhiều bản (nghỉ phép 2023/2024, mật khẩu v1/v2) — retrieval lấy lẫn bản cũ, hoặc thiếu bản cũ khi người dùng hỏi "có gì thay đổi".
+  - **Câu hỏi nhiều ý (multi-hop):** "Senior 9 năm thâm niên được bao nhiêu ngày phép và lương bao nhiêu" — một truy vấn chỉ lấy được tài liệu của một ý.
+  - **Câu hỏi tính toán:** phạt tạm ứng quá hạn, hoàn trả chi phí đào tạo — LLM áp đúng quy định nhưng bỏ bước (không quy đổi số ngày quá hạn).
+  - **Latency:** rerank bằng bge-reranker-v2-m3 trên CPU mất 6–9 s cho 20 ứng viên, quá chậm cho chat.
+  - **PDF scan:** 2/3 file PDF (`BCTC.pdf`, Nghị định 13/2023) không có text layer nên hiện bị bỏ qua.
 
 #### 2. Kế hoạch cải tiến
-1. **Chunking strategy:** [Gợi ý: tài liệu có cấu trúc (quy chế, hướng dẫn) → structure-aware + hierarchical; nếu dùng semantic thì đo phân bố similarity trước để chọn threshold]
-2. **Search retrieval:** [Gợi ý: đo dense vs BM25 vs hybrid trên bộ câu hỏi của chính project trước khi chọn; cân nhắc RRF có trọng số]
-3. **Reranking:** [Gợi ý: bge-reranker-v2-m3 cho tiếng Việt; cần GPU hoặc giảm số ứng viên nếu yêu cầu latency thấp]
-4. **Evaluation:** [Gợi ý: RAGAS 4 metrics + answer correctness cho câu hỏi tính toán; judge đủ mạnh, chạy nhiều lần]
-5. **Enrichment:** [Gợi ý: contextual prepend có truyền toàn văn tài liệu; metadata version/ngày hiệu lực nếu tài liệu có nhiều phiên bản]
+1. **Chunking strategy:** Structure-aware theo heading (`#`, `##`) làm đơn vị child để giữ trọn từng điều khoản và bảng biểu, kết hợp hierarchical (child → parent = cả tài liệu/chương) khi gửi cho LLM. Không dùng semantic chunking với MiniLM: đã đo 0% cặp câu tiếng Việt đạt threshold 0.85; nếu cần semantic thì dùng bge-m3 và chọn threshold theo percentile phân bố similarity.
+2. **Search retrieval:** Hybrid BM25 + dense nhưng **RRF có trọng số** nghiêng về dense (trên dữ liệu lab dense fact-recall@5 = 0.70 > hybrid 0.64 > BM25 0.57); giữ BM25 cho mã văn bản, số hiệu, từ viết tắt (MFA, VPN, P3-P4). Thêm **query decomposition** cho câu hỏi nhiều ý: LLM tách sub-query → search + rerank từng sub-query → gộp context.
+3. **Reranking:** Giữ bge-reranker-v2-m3 (Flashrank MultiBERT nhanh hơn nhưng phân biệt kém với tiếng Việt). Giảm latency bằng: chạy trên GPU hoặc bản ONNX/FP16, giảm ứng viên từ 20 xuống ~10, cache kết quả cho câu hỏi lặp lại. Mục tiêu < 500 ms cho bước rerank.
+4. **Evaluation:** Xây test set riêng ~50 câu chia nhóm (tra cứu, số liệu, multi-hop, xung đột phiên bản, tính toán). Chạy RAGAS 4 metrics + **answer correctness** (để không phạt nhầm phép tính đúng như faithfulness đang làm). Dùng judge mạnh hơn model sinh câu trả lời, chạy 2–3 lần và báo cáo trung bình ± độ lệch; đưa vào CI để mỗi thay đổi pipeline đều so được với baseline.
+5. **Enrichment:** Contextual prepend có truyền toàn văn tài liệu (câu context ghi tên chính sách + phiên bản), HyQA nối vào text index. Bổ sung metadata có cấu trúc `policy_family`, `version`, `effective_date` để: (a) mặc định lọc bản đang hiệu lực, (b) khi người dùng hỏi về thay đổi thì kéo kèm các phiên bản cùng họ. OCR (vd. PaddleOCR/Tesseract tiếng Việt) cho PDF scan trước khi chunk.
 
 #### 3. Timeline triển khai
-- **Tuần 1:** ...
-- **Tuần 2:** ...
+- **Tuần 1:** Xây test set 50 câu + harness đánh giá (RAGAS + answer correctness, judge cố định, chạy lặp). Chuyển chunking sang structure-aware + hierarchical, thêm metadata phiên bản; OCR 2 file PDF scan. Đo lại baseline trên test set mới.
+- **Tuần 2:** RRF có trọng số + query decomposition cho câu hỏi nhiều ý; prompt trả lời từng bước cho câu hỏi tính toán. Tối ưu latency rerank (GPU/ONNX, giảm ứng viên, cache). So sánh từng thay đổi với baseline bằng harness tuần 1, giữ lại thay đổi nào cải thiện thật.
