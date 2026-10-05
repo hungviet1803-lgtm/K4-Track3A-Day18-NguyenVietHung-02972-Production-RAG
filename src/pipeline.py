@@ -17,6 +17,13 @@ from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_re
 from src.m5_enrichment import enrich_chunks
 from config import RERANK_TOP_K
 
+ANSWER_SYSTEM_PROMPT = (
+    "Bạn là trợ lý tra cứu chính sách nội bộ. Trả lời CHỈ dựa trên context, ngắn gọn và trả lời "
+    "thẳng vào câu hỏi, giữ nguyên số liệu. Nếu context có nhiều phiên bản của cùng một chính sách, "
+    "dùng phiên bản có ngày hiệu lực mới nhất. Nếu câu hỏi cần tính toán, nêu căn cứ rồi tính. "
+    "Nếu context không có thông tin → nói 'Không tìm thấy.'"
+)
+
 
 def build_pipeline():
     """Build production RAG pipeline."""
@@ -29,11 +36,17 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    # parent_id chỉ duy nhất trong 1 tài liệu (parent_0, parent_1...) → key theo (source, parent_id)
+    parent_store: dict[tuple[str, str], str] = {}
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        for p in parents:
+            parent_store[(doc["metadata"]["source"], p.metadata["parent_id"])] = p.text
         for child in children:
-            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
-    print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
+            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id},
+                               "document": doc["text"]})  # toàn văn cho contextual enrichment (M5)
+    print(f"  ✓ {len(all_chunks)} chunks / {len(parent_store)} parents from {len(docs)} documents "
+          f"({time.time()-t0:.1f}s)", flush=True)
 
     # Step 2: Enrichment (M5)
     t0 = time.time()
@@ -50,6 +63,7 @@ def build_pipeline():
     print(f"\n[3/4] Indexing {len(all_chunks)} chunks (BM25 + Dense)...", flush=True)
     search = HybridSearch()
     search.index(all_chunks)
+    search.parent_store = parent_store
     print(f"  ✓ Indexed ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 4: Reranker (M3)
@@ -66,16 +80,26 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    top = reranked if reranked else results[:RERANK_TOP_K]
 
-    from config import OPENAI_API_KEY
-    if OPENAI_API_KEY and contexts:
+    # Retrieve child (precision) → trả parent (đủ ngữ cảnh) cho LLM. Nhiều child cùng
+    # parent chỉ đưa parent 1 lần, giữ thứ tự theo điểm rerank.
+    parent_store = getattr(search, "parent_store", {})
+    contexts, seen = [], set()
+    for r in top:
+        key = (r.metadata.get("source"), r.metadata.get("parent_id"))
+        text = parent_store.get(key, r.text)
+        if key not in seen:
+            seen.add(key)
+            contexts.append(text)
+
+    from config import LLM_API_KEY, LLM_MODEL, make_llm_client
+    if LLM_API_KEY and contexts:
         try:
-            from openai import OpenAI
-            client = OpenAI()
-            context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
+            client = make_llm_client()
+            context_str = "\n\n---\n\n".join(contexts)
+            resp = client.chat.completions.create(model=LLM_MODEL, temperature=0, messages=[
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
             ])
             answer = resp.choices[0].message.content
